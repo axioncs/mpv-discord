@@ -1,10 +1,14 @@
 package main
 
 import (
+	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log"
+	"mime/multipart"
+	"net/http"
 	"os"
 	"strings"
 	"syscall"
@@ -15,9 +19,18 @@ import (
 )
 
 var (
-	client   *mpvrpc.Client
-	presence *discordrpc.Presence
+	client        *mpvrpc.Client
+	presence      *discordrpc.Presence
+	discordToken  string
+	tinyToken     string
 )
+
+// urlCache maps thumbnail source (URL or local path) -> final TinyURL,
+// so we don't re-upload the same image on every 1-second poll tick.
+var urlCache = map[string]string{}
+
+// cachedAppId is fetched once on first upload and reused for all subsequent ones.
+var cachedAppId = ""
 
 func init() {
 	log.SetOutput(os.Stdout)
@@ -25,6 +38,8 @@ func init() {
 
 	client = mpvrpc.NewClient()
 	presence = discordrpc.NewPresence(os.Args[2])
+	discordToken = os.Args[3]
+	tinyToken = os.Args[4]
 }
 
 var currTime int64 = time.Now().Local().UnixMilli()
@@ -33,18 +48,147 @@ func refreshCurrTime() {
 	currTime = time.Now().Local().UnixMilli()
 }
 
-// getThumbnailURL reads the thumbnail URL set by discord.lua via the
-// user-data property. Falls back to the static "mpv" asset key if unset
-// or if the value is not a valid https:// URL.
-func getThumbnailURL() string {
-	val, err := client.GetPropertyString("user-data/discord-thumbnail")
-	if err != nil || val == "" {
+// getAppId fetches the application ID from Discord using the bot token.
+func getAppId() (string, error) {
+	if discordToken == "" {
+		return "", errors.New("discord token not provided")
+	}
+	req, _ := http.NewRequest("GET", "https://discord.com/api/v10/applications/@me", nil)
+	req.Header.Set("Authorization", "Bot "+discordToken)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	var result struct {
+		ID string `json:"id"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return "", err
+	}
+	return result.ID, nil
+}
+
+// uploadToDiscord uploads a local image file path OR fetches a remote URL
+// and uploads its bytes to Discord as an ephemeral application attachment.
+// Returns the raw Discord CDN URL (with expiring query params).
+func uploadToDiscord(appId string, imageSource string) (string, error) {
+	var imageBytes []byte
+	var err error
+
+	if strings.HasPrefix(imageSource, "https://") {
+		// Remote URL (e.g. YouTube thumbnail) — download first
+		resp, err := http.Get(imageSource)
+		if err != nil {
+			return "", fmt.Errorf("failed to download image: %w", err)
+		}
+		defer resp.Body.Close()
+		imageBytes, err = io.ReadAll(resp.Body)
+		if err != nil {
+			return "", fmt.Errorf("failed to read image body: %w", err)
+		}
+	} else {
+		// Local file path (e.g. ffmpeg-extracted frame)
+		imageBytes, err = os.ReadFile(imageSource)
+		if err != nil {
+			return "", fmt.Errorf("failed to read local image: %w", err)
+		}
+	}
+
+	body := &bytes.Buffer{}
+	writer := multipart.NewWriter(body)
+	part, _ := writer.CreateFormFile("file", "thumbnail.jpg")
+	part.Write(imageBytes)
+	writer.Close()
+
+	url := fmt.Sprintf("https://discord.com/api/v10/applications/%s/attachment", appId)
+	req, _ := http.NewRequest("POST", url, body)
+	req.Header.Set("Authorization", "Bot "+discordToken)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	var result struct {
+		Attachment struct {
+			URL string `json:"url"`
+		} `json:"attachment"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return "", err
+	}
+	return result.Attachment.URL, nil
+}
+
+// toTinyURL shortens a URL using TinyURL API so Discord can't strip the query params.
+func toTinyURL(rawURL string) (string, error) {
+	if tinyToken == "" {
+		return "", errors.New("tinyurl token not provided")
+	}
+	payload, _ := json.Marshal(map[string]string{"url": rawURL})
+	req, _ := http.NewRequest("POST", "https://api.tinyurl.com/create?api_token="+tinyToken, bytes.NewBuffer(payload))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	var result struct {
+		Data struct {
+			TinyURL string `json:"tiny_url"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return "", err
+	}
+	return result.Data.TinyURL, nil
+}
+
+// getThumbnailImageKey reads the thumbnail source set by discord.lua
+// (either a YouTube https:// URL or a local file path set via user-data),
+// uploads it to Discord, shortens via TinyURL, caches and returns the result.
+// Falls back to "mpv" asset key on any error or if tokens aren't configured.
+func getThumbnailImageKey() string {
+	if discordToken == "" || tinyToken == "" {
 		return "mpv"
 	}
-	if strings.HasPrefix(val, "https://") {
-		return val
+
+	source, err := client.GetPropertyString("user-data/discord-thumbnail")
+	if err != nil || source == "" || source == "mpv" {
+		return "mpv"
 	}
-	return "mpv"
+
+	// Return cached TinyURL if we've already processed this source
+	if cached, ok := urlCache[source]; ok {
+		return cached
+	}
+
+	if cachedAppId == "" {
+		cachedAppId, err = getAppId()
+		if err != nil {
+			log.Printf("(thumbnail): failed to get app ID: %v", err)
+			return "mpv"
+		}
+	}
+
+	cdnURL, err := uploadToDiscord(cachedAppId, source)
+	if err != nil {
+		log.Printf("(thumbnail): Discord upload failed: %v", err)
+		return "mpv"
+	}
+
+	tinyURL, err := toTinyURL(cdnURL)
+	if err != nil {
+		log.Printf("(thumbnail): TinyURL failed: %v", err)
+		return "mpv"
+	}
+
+	log.Printf("(thumbnail): %s -> %s", source, tinyURL)
+	urlCache[source] = tinyURL
+	return tinyURL
 }
 
 func getActivity() (activity discordrpc.Activity, err error) {
@@ -57,8 +201,8 @@ func getActivity() (activity discordrpc.Activity, err error) {
 		return
 	}
 
-	// Large Image — use thumbnail URL from Lua if available, else "mpv" logo
-	activity.LargeImageKey = getThumbnailURL()
+	// Large Image
+	activity.LargeImageKey = getThumbnailImageKey()
 	activity.LargeImageText = "mpv"
 	if version := getPropertyString("mpv-version"); version != "" {
 		activity.LargeImageText += " " + version[4:]
@@ -148,13 +292,12 @@ func openClient() {
 }
 
 func openPresence() {
-	// try until success
 	for range time.Tick(500 * time.Millisecond) {
 		if client.IsClosed() {
-			return // stop trying when mpv shuts down
+			return
 		}
 		if err := presence.Open(); err == nil {
-			break // break when successfully opened
+			break
 		}
 	}
 	log.Println("(discord-ipc): connected")
@@ -193,7 +336,6 @@ func main() {
 			go func() {
 				if err = presence.Update(activity); err != nil {
 					if errors.Is(err, syscall.EPIPE) {
-						// close it before retrying
 						if err = presence.Close(); err != nil {
 							log.Fatalln(err)
 						}

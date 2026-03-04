@@ -10,6 +10,8 @@ local options = {
 	socket_path = "/tmp/mpvsocket",
 	use_static_socket_path = true,
 	autohide_threshold = 0,
+	discord_token = "",
+	tinyurl_token = "",
 }
 opts.read_options(options, "discord")
 
@@ -18,7 +20,7 @@ if options.binary_path == "" then
 	os.exit(1)
 end
 
-function file_exists(path) -- fix(#23): use this instead of utils.file_info
+function file_exists(path)
 	local f = io.open(path, "r")
 	if f ~= nil then
 		io.close(f)
@@ -41,7 +43,7 @@ if not options.use_static_socket_path then
 	local pid = utils.getpid()
 	local filename = ("mpv-discord-%s"):format(pid)
 	if socket_path == "" then
-		socket_path = "/tmp/" -- default
+		socket_path = "/tmp/"
 	end
 	socket_path = utils.join_path(socket_path, filename)
 elseif socket_path == "" then
@@ -53,6 +55,10 @@ mp.set_property("input-ipc-server", socket_path)
 
 -- ============================================================
 -- Thumbnail resolution
+-- Sets user-data/discord-thumbnail to either:
+--   - A YouTube thumbnail https:// URL  (Go will download + upload to Discord)
+--   - A local file path to a ffmpeg frame  (Go will read + upload to Discord)
+--   - "mpv" as fallback (Go shows the registered mpv asset)
 -- ============================================================
 
 local function get_youtube_id(url)
@@ -62,10 +68,9 @@ local function get_youtube_id(url)
 		or url:match("youtube%.com/shorts/([a-zA-Z0-9_%-]+)")
 end
 
-local function upload_thumbnail(filepath)
+local function extract_local_frame(filepath)
+	-- Extract a frame at 10s, fall back to first frame for short files
 	local tmpfile = os.tmpname() .. ".jpg"
-
-	-- Try extracting at 10s first, fall back to first frame for short files
 	local cmd1 = string.format(
 		'ffmpeg -y -ss 10 -i %q -vframes 1 -q:v 5 %q -loglevel quiet 2>/dev/null',
 		filepath, tmpfile
@@ -77,36 +82,16 @@ local function upload_thumbnail(filepath)
 	if os.execute(cmd1) ~= 0 then
 		os.execute(cmd2)
 	end
-
-	-- Check the file actually got created
-	local f = io.open(tmpfile, "r")
-	if not f then
-		msg.warn("Discord: ffmpeg failed to extract thumbnail frame")
-		return nil
-	end
-	f:close()
-
-	-- Upload to litterbox (expires in 1 hour)
-	local curl_cmd = string.format(
-		'curl -sf -F "reqtype=fileupload" -F "time=1h" -F "fileToUpload=@%s" '
-		.. '"https://litterbox.catbox.moe/resources/internals/api.php"',
-		tmpfile
-	)
-	local handle = io.popen(curl_cmd)
-	if not handle then
+	-- Verify file exists and has content
+	local f = io.open(tmpfile, "rb")
+	if f then
+		local size = f:seek("end")
+		f:close()
+		if size and size > 0 then
+			return tmpfile
+		end
 		os.remove(tmpfile)
-		msg.warn("Discord: curl failed to run")
-		return nil
 	end
-	local url = handle:read("*a")
-	handle:close()
-	os.remove(tmpfile)
-
-	url = url and url:match("^%s*(.-)%s*$") -- trim whitespace
-	if url and url:match("^https://") then
-		return url
-	end
-	msg.warn("Discord: upload returned unexpected response: " .. (url or "nil"))
 	return nil
 end
 
@@ -119,19 +104,20 @@ mp.register_event("file-loaded", function()
 
 	local yt_id = get_youtube_id(path)
 	if yt_id then
-		local thumb = "https://img.youtube.com/vi/" .. yt_id .. "/hqdefault.jpg"
-		mp.set_property("user-data/discord-thumbnail", thumb)
-		msg.info("Discord thumbnail (YouTube): " .. thumb)
+		-- Pass the YouTube thumbnail URL — Go will download and upload it
+		local thumb_url = "https://img.youtube.com/vi/" .. yt_id .. "/hqdefault.jpg"
+		mp.set_property("user-data/discord-thumbnail", thumb_url)
+		msg.info("Discord thumbnail source (YouTube): " .. thumb_url)
 	else
-		-- Run after a short delay so mpv startup isn't blocked
-		mp.add_timeout(1.0, function()
-			msg.info("Discord: extracting and uploading thumbnail for local file...")
-			local url = upload_thumbnail(path)
-			if url then
-				mp.set_property("user-data/discord-thumbnail", url)
-				msg.info("Discord thumbnail uploaded: " .. url)
+		-- Local file: extract a frame with ffmpeg, pass the temp file path to Go
+		mp.add_timeout(0.5, function()
+			msg.info("Discord: extracting thumbnail frame from local file...")
+			local frame_path = extract_local_frame(path)
+			if frame_path then
+				mp.set_property("user-data/discord-thumbnail", frame_path)
+				msg.info("Discord thumbnail source (local frame): " .. frame_path)
 			else
-				msg.warn("Discord: thumbnail upload failed, keeping default logo")
+				msg.warn("Discord: ffmpeg frame extraction failed, using default logo")
 			end
 		end)
 	end
@@ -152,6 +138,8 @@ local function start()
 				options.binary_path,
 				socket_path,
 				options.client_id,
+				options.discord_token or "",
+				options.tinyurl_token or "",
 			},
 		}, function() end)
 		msg.info("launched subprocess")
