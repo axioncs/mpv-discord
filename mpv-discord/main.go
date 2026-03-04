@@ -2,7 +2,6 @@ package main
 
 import (
 	"bytes"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -19,18 +18,13 @@ import (
 )
 
 var (
-	client        *mpvrpc.Client
-	presence      *discordrpc.Presence
-	discordToken  string
-	tinyToken     string
+	client   *mpvrpc.Client
+	presence *discordrpc.Presence
 )
 
-// urlCache maps thumbnail source (URL or local path) -> final TinyURL,
+// urlCache maps thumbnail source (URL or local path) -> uploaded Litterbox URL,
 // so we don't re-upload the same image on every 1-second poll tick.
 var urlCache = map[string]string{}
-
-// cachedAppId is fetched once on first upload and reused for all subsequent ones.
-var cachedAppId = ""
 
 func init() {
 	log.SetOutput(os.Stdout)
@@ -38,8 +32,6 @@ func init() {
 
 	client = mpvrpc.NewClient()
 	presence = discordrpc.NewPresence(os.Args[2])
-	discordToken = os.Args[3]
-	tinyToken = os.Args[4]
 }
 
 var currTime int64 = time.Now().Local().UnixMilli()
@@ -48,36 +40,15 @@ func refreshCurrTime() {
 	currTime = time.Now().Local().UnixMilli()
 }
 
-// getAppId fetches the application ID from Discord using the bot token.
-func getAppId() (string, error) {
-	if discordToken == "" {
-		return "", errors.New("discord token not provided")
-	}
-	req, _ := http.NewRequest("GET", "https://discord.com/api/v10/applications/@me", nil)
-	req.Header.Set("Authorization", "Bot "+discordToken)
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-	var result struct {
-		ID string `json:"id"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return "", err
-	}
-	return result.ID, nil
-}
-
-// uploadToDiscord uploads a local image file path OR fetches a remote URL
-// and uploads its bytes to Discord as an ephemeral application attachment.
-// Returns the raw Discord CDN URL (with expiring query params).
-func uploadToDiscord(appId string, imageSource string) (string, error) {
+// uploadToLitterbox uploads a local file path or remote https:// URL to
+// Litterbox (litterbox.catbox.moe) with a 72h expiry. No account or API key
+// needed. Returns a clean https://litter.catbox.moe/XXXXXX.jpg URL.
+func uploadToLitterbox(imageSource string) (string, error) {
 	var imageBytes []byte
 	var err error
 
+	imageSource = strings.TrimSpace(imageSource)
 	if strings.HasPrefix(imageSource, "https://") {
-		// Remote URL (e.g. YouTube thumbnail) — download first
 		resp, err := http.Get(imageSource)
 		if err != nil {
 			return "", fmt.Errorf("failed to download image: %w", err)
@@ -88,7 +59,6 @@ func uploadToDiscord(appId string, imageSource string) (string, error) {
 			return "", fmt.Errorf("failed to read image body: %w", err)
 		}
 	} else {
-		// Local file path (e.g. ffmpeg-extracted frame)
 		imageBytes, err = os.ReadFile(imageSource)
 		if err != nil {
 			return "", fmt.Errorf("failed to read local image: %w", err)
@@ -97,13 +67,13 @@ func uploadToDiscord(appId string, imageSource string) (string, error) {
 
 	body := &bytes.Buffer{}
 	writer := multipart.NewWriter(body)
-	part, _ := writer.CreateFormFile("file", "thumbnail.jpg")
+	writer.WriteField("reqtype", "fileupload")
+	writer.WriteField("time", "72h")
+	part, _ := writer.CreateFormFile("fileToUpload", "thumbnail.jpg")
 	part.Write(imageBytes)
 	writer.Close()
 
-	url := fmt.Sprintf("https://discord.com/api/v10/applications/%s/attachment", appId)
-	req, _ := http.NewRequest("POST", url, body)
-	req.Header.Set("Authorization", "Bot "+discordToken)
+	req, _ := http.NewRequest("POST", "https://litterbox.catbox.moe/resources/internals/api.php", body)
 	req.Header.Set("Content-Type", writer.FormDataContentType())
 
 	resp, err := http.DefaultClient.Do(req)
@@ -112,83 +82,50 @@ func uploadToDiscord(appId string, imageSource string) (string, error) {
 	}
 	defer resp.Body.Close()
 
-	var result struct {
-		Attachment struct {
-			URL string `json:"url"`
-		} `json:"attachment"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return "", err
-	}
-	return result.Attachment.URL, nil
-}
-
-// toTinyURL shortens a URL using TinyURL API so Discord can't strip the query params.
-func toTinyURL(rawURL string) (string, error) {
-	if tinyToken == "" {
-		return "", errors.New("tinyurl token not provided")
-	}
-	payload, _ := json.Marshal(map[string]string{"url": rawURL})
-	req, _ := http.NewRequest("POST", "https://api.tinyurl.com/create?api_token="+tinyToken, bytes.NewBuffer(payload))
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := http.DefaultClient.Do(req)
+	respBytes, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("failed to read Litterbox response: %w", err)
 	}
-	defer resp.Body.Close()
-	var result struct {
-		Data struct {
-			TinyURL string `json:"tiny_url"`
-		} `json:"data"`
+	result := strings.TrimSpace(string(respBytes))
+	log.Printf("(thumbnail): Litterbox response: %s", result)
+
+	if !strings.HasPrefix(result, "https://") {
+		return "", fmt.Errorf("Litterbox upload failed: %s", result)
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return "", err
-	}
-	return result.Data.TinyURL, nil
+	return result, nil
 }
 
 // getThumbnailImageKey reads the thumbnail source set by discord.lua
 // (either a YouTube https:// URL or a local file path set via user-data),
-// uploads it to Discord, shortens via TinyURL, caches and returns the result.
-// Falls back to "mpv" asset key on any error or if tokens aren't configured.
+// uploads it to Litterbox, caches and returns the URL.
+// Falls back to "mpv" asset key on any error.
 func getThumbnailImageKey() string {
-	if discordToken == "" || tinyToken == "" {
-		return "mpv"
-	}
-
 	source, err := client.GetPropertyString("user-data/discord-thumbnail")
-	if err != nil || source == "" || source == "mpv" {
+	if err != nil {
+		log.Printf("(thumbnail): property read error: %v", err)
+		return "mpv"
+	}
+	source = strings.TrimSpace(source)
+	// mpv sometimes returns the value JSON-encoded with surrounding quotes — strip them
+	source = strings.Trim(source, "\"")
+	source = strings.TrimSpace(source)
+	if source == "" || source == "mpv" {
 		return "mpv"
 	}
 
-	// Return cached TinyURL if we've already processed this source
 	if cached, ok := urlCache[source]; ok {
 		return cached
 	}
 
-	if cachedAppId == "" {
-		cachedAppId, err = getAppId()
-		if err != nil {
-			log.Printf("(thumbnail): failed to get app ID: %v", err)
-			return "mpv"
-		}
-	}
-
-	cdnURL, err := uploadToDiscord(cachedAppId, source)
+	lbURL, err := uploadToLitterbox(source)
 	if err != nil {
-		log.Printf("(thumbnail): Discord upload failed: %v", err)
+		log.Printf("(thumbnail): Litterbox upload failed: %v", err)
 		return "mpv"
 	}
 
-	tinyURL, err := toTinyURL(cdnURL)
-	if err != nil {
-		log.Printf("(thumbnail): TinyURL failed: %v", err)
-		return "mpv"
-	}
-
-	log.Printf("(thumbnail): %s -> %s", source, tinyURL)
-	urlCache[source] = tinyURL
-	return tinyURL
+	log.Printf("(thumbnail): %s -> %s", source, lbURL)
+	urlCache[source] = lbURL
+	return lbURL
 }
 
 func getActivity() (activity discordrpc.Activity, err error) {

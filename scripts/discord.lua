@@ -10,8 +10,6 @@ local options = {
 	socket_path = "/tmp/mpvsocket",
 	use_static_socket_path = true,
 	autohide_threshold = 0,
-	discord_token = "",
-	tinyurl_token = "",
 }
 opts.read_options(options, "discord")
 
@@ -138,8 +136,6 @@ local function start()
 				options.binary_path,
 				socket_path,
 				options.client_id,
-				options.discord_token or "",
-				options.tinyurl_token or "",
 			},
 		}, function() end)
 		msg.info("launched subprocess")
