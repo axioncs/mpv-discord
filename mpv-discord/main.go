@@ -6,6 +6,7 @@ import (
 	"io"
 	"log"
 	"os"
+	"strings"
 	"syscall"
 	"time"
 
@@ -32,6 +33,20 @@ func refreshCurrTime() {
 	currTime = time.Now().Local().UnixMilli()
 }
 
+// getThumbnailURL reads the thumbnail URL set by discord.lua via the
+// user-data property. Falls back to the static "mpv" asset key if unset
+// or if the value is not a valid https:// URL.
+func getThumbnailURL() string {
+	val, err := client.GetPropertyString("user-data/discord-thumbnail")
+	if err != nil || val == "" {
+		return "mpv"
+	}
+	if strings.HasPrefix(val, "https://") {
+		return val
+	}
+	return "mpv"
+}
+
 func getActivity() (activity discordrpc.Activity, err error) {
 	getProperty := func(key string) (prop interface{}) {
 		prop, err = client.GetProperty(key)
@@ -42,8 +57,8 @@ func getActivity() (activity discordrpc.Activity, err error) {
 		return
 	}
 
-	// Large Image
-	activity.LargeImageKey = "mpv"
+	// Large Image — use thumbnail URL from Lua if available, else "mpv" logo
+	activity.LargeImageKey = getThumbnailURL()
 	activity.LargeImageText = "mpv"
 	if version := getPropertyString("mpv-version"); version != "" {
 		activity.LargeImageText += " " + version[4:]
@@ -117,8 +132,8 @@ func getActivity() (activity discordrpc.Activity, err error) {
 
 	if pausing != nil && !pausing.(bool) {
 		activity.Timestamps = &discordrpc.ActivityTimestamps{
-			Start: startTimePos, 
-			End: duration,
+			Start: startTimePos,
+			End:   duration,
 		}
 		refreshCurrTime()
 	}

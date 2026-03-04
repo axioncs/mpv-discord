@@ -51,6 +51,96 @@ end
 msg.info(("(mpv-ipc): %s"):format(socket_path))
 mp.set_property("input-ipc-server", socket_path)
 
+-- ============================================================
+-- Thumbnail resolution
+-- ============================================================
+
+local function get_youtube_id(url)
+	if not url then return nil end
+	return url:match("youtube%.com/watch%?.*v=([a-zA-Z0-9_%-]+)")
+		or url:match("youtu%.be/([a-zA-Z0-9_%-]+)")
+		or url:match("youtube%.com/shorts/([a-zA-Z0-9_%-]+)")
+end
+
+local function upload_thumbnail(filepath)
+	local tmpfile = os.tmpname() .. ".jpg"
+
+	-- Try extracting at 10s first, fall back to first frame for short files
+	local cmd1 = string.format(
+		'ffmpeg -y -ss 10 -i %q -vframes 1 -q:v 5 %q -loglevel quiet 2>/dev/null',
+		filepath, tmpfile
+	)
+	local cmd2 = string.format(
+		'ffmpeg -y -i %q -vframes 1 -q:v 5 %q -loglevel quiet 2>/dev/null',
+		filepath, tmpfile
+	)
+	if os.execute(cmd1) ~= 0 then
+		os.execute(cmd2)
+	end
+
+	-- Check the file actually got created
+	local f = io.open(tmpfile, "r")
+	if not f then
+		msg.warn("Discord: ffmpeg failed to extract thumbnail frame")
+		return nil
+	end
+	f:close()
+
+	-- Upload to litterbox (expires in 1 hour)
+	local curl_cmd = string.format(
+		'curl -sf -F "reqtype=fileupload" -F "time=1h" -F "fileToUpload=@%s" '
+		.. '"https://litterbox.catbox.moe/resources/internals/api.php"',
+		tmpfile
+	)
+	local handle = io.popen(curl_cmd)
+	if not handle then
+		os.remove(tmpfile)
+		msg.warn("Discord: curl failed to run")
+		return nil
+	end
+	local url = handle:read("*a")
+	handle:close()
+	os.remove(tmpfile)
+
+	url = url and url:match("^%s*(.-)%s*$") -- trim whitespace
+	if url and url:match("^https://") then
+		return url
+	end
+	msg.warn("Discord: upload returned unexpected response: " .. (url or "nil"))
+	return nil
+end
+
+mp.register_event("file-loaded", function()
+	local path = mp.get_property("path")
+	if not path then return end
+
+	-- Reset to default while resolving
+	mp.set_property("user-data/discord-thumbnail", "mpv")
+
+	local yt_id = get_youtube_id(path)
+	if yt_id then
+		local thumb = "https://img.youtube.com/vi/" .. yt_id .. "/hqdefault.jpg"
+		mp.set_property("user-data/discord-thumbnail", thumb)
+		msg.info("Discord thumbnail (YouTube): " .. thumb)
+	else
+		-- Run after a short delay so mpv startup isn't blocked
+		mp.add_timeout(1.0, function()
+			msg.info("Discord: extracting and uploading thumbnail for local file...")
+			local url = upload_thumbnail(path)
+			if url then
+				mp.set_property("user-data/discord-thumbnail", url)
+				msg.info("Discord thumbnail uploaded: " .. url)
+			else
+				msg.warn("Discord: thumbnail upload failed, keeping default logo")
+			end
+		end)
+	end
+end)
+
+-- ============================================================
+-- End thumbnail resolution
+-- ============================================================
+
 local cmd = nil
 
 local function start()
