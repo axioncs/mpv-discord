@@ -68,13 +68,17 @@ end
 
 local function extract_local_frame(filepath)
 	-- Extract a frame at 10s, fall back to first frame for short files
+	-- The pad filter centers the frame in a square canvas (pillarbox/letterbox)
+	-- so Discord doesn't crop the image. Commas in the filter must be escaped
+	-- with \ to prevent ffmpeg treating them as filter separators.
 	local tmpfile = os.tmpname() .. ".jpg"
+	local pad = "'pad=max(iw\\,ih):max(iw\\,ih):(ow-iw)/2:(oh-ih)/2:black'"
 	local cmd1 = string.format(
-		'ffmpeg -y -ss 10 -i %q -vframes 1 -q:v 5 %q -loglevel quiet 2>/dev/null',
+		"ffmpeg -y -ss 10 -i %q -vframes 1 -vf " .. pad .. " -q:v 5 %q -loglevel quiet 2>/dev/null",
 		filepath, tmpfile
 	)
 	local cmd2 = string.format(
-		'ffmpeg -y -i %q -vframes 1 -q:v 5 %q -loglevel quiet 2>/dev/null',
+		"ffmpeg -y -i %q -vframes 1 -vf " .. pad .. " -q:v 5 %q -loglevel quiet 2>/dev/null",
 		filepath, tmpfile
 	)
 	if os.execute(cmd1) ~= 0 then
